@@ -2,11 +2,16 @@ trigger:
   paths:
     include:
       - 'Api/*'
+      - 'docker/Api*'
+      - 'devops/Api*'
 
 name: $(Build.DefinitionName).1.0$(Rev:.r)
 pool: Kubernetes Agents
 
 parameters:
+- name: 'application'
+  type: string
+  default: 'api-integration'
 - name: 'acr'
   type: string
   default: 'ACR CapitalOnTap'
@@ -28,18 +33,16 @@ resources:
     - container: dotnetsdk
       image: mcr.microsoft.com/dotnet/sdk:6.0
     
+    # Does not work 
     - container: octocli
       image: octopusdeploy/octo
-
-    # - container: gitversion
-    #   image: capitalontap.azurecr.io/library/gittools/gitversion:6.0.0-alpine.3.16-6.0
-    #   endpoint: ACR CapitalOnTap
+      mapDockerSocket: false
 
 stages:
 - stage: DockerCompose
   displayName: Running Docker Compose
   variables:
-    APPLICATION: "api-integration"
+    APPLICATION: "${{ parameters.application }}"
     AZURE_CLIENT_ID: fa45590d-ded7-4edd-a4ef-7bb8858e1234 # in keeper under "ci-poc (ado test pipeline)"
     AZURE_TENANT_ID: c6bd9460-ef43-4cf1-878e-6416537f0495
   jobs:
@@ -54,6 +57,7 @@ stages:
         docker compose -f $(System.DefaultWorkingDirectory)/docker-compose.tests.yml up $APPLICATION --exit-code-from $APPLICATION
       displayName: Docker Compose
 
+# Need to template this step. DevOps have a already templated this we will need to add context param and update the docker file location parameters
 - stage: DockerBuildPush
   jobs:
     - job: Build_Docker
@@ -88,43 +92,87 @@ stages:
           command: logout
           containerRegistry: ${{ parameters.acr }}
 
-- stage: BuildOctoDirectory
-  displayName: BuildOctoDirectory
+- stage: OctoBuildPush
+  displayName: OctoBuildPush
   jobs:
-    - job: BuildDirectory
+    - job: OctoBuildDirectory
       steps:
         - script: |
             mkdir -p ./deployment
             cp ./devops/Api/kubernetes/*.yaml ./deployment
             cp ./Api/appsettings.json ./deployment
             cp ./Api/keyvaults.json ./deployment
-            sed -i 's/$IMAGETAG/containerisation.poc.api-ado:1.0.0.${{ parameters.tags }}/g' ./deployment/deployment.yaml
+            sed -i 's/$IMAGETAG/containerisation.poc.api-ado:${{ parameters.tags }}/g' ./deployment/deployment.yaml
+            ls deployment
+            pwd
+          displayName: CreateOctoDir
 
-- stage: PushToOcto
-  displayName: PushToOcto
-  variables:
-    OctopusChannel: Default
-    OctoProjectName: "Containerisation.Api"
-  jobs:
-  - job: PushToOcto
-    steps:
-    - script: |
-        octo pack --id="containerisation.poc.api" --format="zip" --version="1.0.0.${{ parameters.tags }}" --basePath="./deployment" --outFolder="./deployment"
-        octo push --package="./deployment/containerisation.poc.api.1.0.0.${{ parameters.tags }}.zip" --server="https://octopus.capitalontap.com" --apiKey="$OctopusApiKey"
-        octo create-release --server="https://octopus.capitalontap.com" --apiKey="$OctopusApiKey" --project="$OctoProjectName" --enableservicemessages --version="1.0.0.${{ parameters.tags }}" --channel="$OctopusChannel" --packageVersion="1.0.0.${{ parameters.tags }}"
-      displayName: PushToOcto
-      target: octocli
+# Installing OctoCli should be included in the build image
+        - script: |
+            apt update && apt install --no-install-recommends gnupg curl ca-certificates apt-transport-https && \
+            curl -sSfL https://apt.octopus.com/public.key | apt-key add - && \
+            sh -c "echo deb https://apt.octopus.com/ stable main > /etc/apt/sources.list.d/octopus.com.list" && \
+            apt update && apt install octopuscli
+          displayName: InstallOctoCli
+        
+        - script: |
+           octo pack --id="containerisation.poc.api" --format="zip" --version="${{ parameters.tags }}" --basePath="./deployment" --outFolder="./deployment"
+           octo push --package="./deployment/containerisation.poc.api.${{ parameters.tags }}.zip" --server="https://octopus.capitalontap.com" --apiKey=$(OctopusApiKey)
+           octo create-release --server="https://octopus.capitalontap.com" --apiKey=$(OctopusApiKey) --project="$(OctoProjectName)" --enableservicemessages --version="${{ parameters.tags }}" --channel="$(OctopusChannel)" --packageVersion="${{ parameters.tags }}"
+          displayName: PackPushOcto
+      variables:
+        OctopusChannel: Default
+        OctoProjectName: "Containerisation.Api"
 
-# - stage: Dotnet
-#   displayName: Running Dotnet Restore
+# Could potentially use Octo tasks that are in ADO instead for the script above
+
+        # - task: CopyFiles@2
+        #   displayName: Copy Files
+        #   inputs:
+        #     SourceFolder: '$(System.DefaultWorkingDirectory)/deployment'
+        #     Contents: '**'
+        #     TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+        # - task: ArchiveFiles@2
+        #   displayName: Create Package
+        #   inputs:
+        #     rootFolderOrFile: '$(Build.ArtifactStagingDirectory)'
+        #     includeRootFolder: false
+        #     archiveType: 'tar'
+        #     archiveFile: '$(Build.ArtifactStagingDirectory)/containerisation.poc.api.1.0.0.${{ parameters.tags }}.tar'
+        #     replaceExistingArchive: true
+
+        # - task: OctopusPush@4
+        #   displayName: Push Package to Octopus Server
+        #   inputs:
+        #     OctoConnectedServiceName: 'Octopus Deploy'
+        #     Space: 'Spaces-1'
+        #     Package: '$(Build.ArtifactStagingDirectory)/containerisation.poc.api.1.0.0.${{ parameters.tags }}.tar'
+        #     Replace: 'true'
+
+        # - task: OctopusCreateRelease@4
+        #   displayName: Create Release
+        #   inputs:
+        #     OctoConnectedServiceName: 'Octopus Deploy'
+        #     Space: 'Spaces-1'
+        #     ProjectGroup: 'Containerisation Poc'
+        #     ProjectName: 'Containerisation.Api'
+        #     Channel: 'Default'
+        #     AdditionalArguments: '--packageVersion="1.0.0.${{ parameters.tags }} --enableservicemessages --version="1.0.0.${{ parameters.tags }}"'
+
+
+# - stage: PushToOcto
+#   displayName: PushToOcto
 #   variables:
-#     SLN_FILE: "Containerisation.PoC.sln" 
+#     OctopusChannel: Default
+#     OctoProjectName: "Containerisation.Api"
 #   jobs:
-#   - job: DotnetTest
+#   - job: PushToOcto
 #     steps:
+#     - checkout: none
 #     - script: |
-#         pwd
-#         ls -lah
-#         dotnet restore "$(System.DefaultWorkingDirectory)/$(SLN_FILE)" --source https://api.nuget.org/v3/index.json --source https://packages.capitalontap.com/v3/index.json
-#       displayName: Dotnet Restore
-#       target: dotnetsdk
+#         octo pack --id="containerisation.poc.api" --format="zip" --version="${{ parameters.tags }}" --basePath="./deployment" --outFolder="./deployment"
+#         octo push --package="./deployment/containerisation.poc.api.${{ parameters.tags }}.zip" --server="https://octopus.capitalontap.com" --apiKey="$(OctopusApiKey)"
+#         octo create-release --server="https://octopus.capitalontap.com" --apiKey="$(OctopusApiKey)" --project="$OctoProjectName" --enableservicemessages --version="${{ parameters.tags }}" --channel="$OctopusChannel" --packageVersion="${{ parameters.tags }}"
+#       displayName: PushToOcto
+#       target: host
